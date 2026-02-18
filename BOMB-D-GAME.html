@@ -1,0 +1,652 @@
+
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Bomb Defusal (CoC)</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin:0; font-family:-apple-system, system-ui, sans-serif; background:#0f0f12; color:#eee; }
+    header { padding:14px 16px; border-bottom:1px solid #23232a; position:sticky; top:0; background:#0f0f12; z-index:2; }
+    main { max-width:900px; margin:0 auto; padding:16px; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; }
+    .card { background:#16161c; border:1px solid #262631; border-radius:14px; padding:14px; }
+    .grow { flex:1 1 320px; }
+    .muted { color:#a6a6b3; }
+    .big { font-size:40px; font-weight:800; letter-spacing:0.5px; }
+    h1 { margin:0; font-size:18px; }
+    h2 { margin:18px 0 10px; font-size:16px; }
+    button { width:100%; padding:14px; border-radius:14px; border:1px solid #2e2e3b; background:#1f1f28; color:#eee; font-size:16px; }
+    button:active { transform: translateY(1px); }
+    input, textarea, select {
+      width:100%; box-sizing:border-box; padding:12px; border-radius:12px;
+      border:1px solid #2e2e3b; background:#121218; color:#eee; font-size:16px;
+    }
+    textarea { min-height: 120px; resize: vertical; }
+    .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .grid3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; }
+    @media (max-width:520px){ .grid3{ grid-template-columns:1fr 1fr; } }
+    .pill { display:inline-block; padding:4px 10px; border:1px solid #2e2e3b; border-radius:999px; font-size:12px; }
+    .ok { color:#7CFC98; }
+    .bad { color:#ff6b6b; }
+    ul.log { list-style:none; padding:0; margin:0; }
+    ul.log li { padding:8px 0; border-bottom:1px solid #23232a; }
+    .split { display:flex; gap:12px; align-items:center; justify-content:space-between; }
+    .danger { border-color:#5a2a2a; }
+    .danger button { background:#2a1414; border-color:#5a2a2a; }
+    .tiny { font-size:12px; }
+    .topbtn { width:auto; padding:10px 12px; border-radius:12px; font-size:14px; }
+  </style>
+</head>
+<body>
+<header class="split">
+  <h1>解除端末</h1>
+  <div class="row" style="gap:8px;">
+    <button id="kpToggleBtn" class="topbtn">KPモード</button>
+    <button id="resetBtn" class="topbtn">リセット</button>
+  </div>
+</header>
+
+<main>
+  <div class="row">
+    <div class="card grow">
+      <div class="split">
+        <div>
+          <div class="muted">状態</div>
+          <div id="statusLine" class="pill"></div>
+        </div>
+        <div style="text-align:right;">
+          <div class="muted">残りターン</div>
+          <div id="turnsLine" class="big"></div>
+        </div>
+      </div>
+      <div class="muted tiny" id="stageHint" style="margin-top:8px;"></div>
+    </div>
+
+    <div class="card grow" id="progressCard">
+      <div class="muted">進捗</div>
+      <div id="progressLine" style="margin-top:8px;"></div>
+      <div id="warningLine" class="muted tiny" style="margin-top:8px;"></div>
+    </div>
+  </div>
+
+  <h2>操作</h2>
+  <div class="card" id="actionCard"></div>
+
+  <h2>ログ</h2>
+  <div class="card">
+    <ul class="log" id="logList"></ul>
+  </div>
+
+  <h2 id="kpTitle" style="display:none;">KP管理</h2>
+  <div class="card" id="kpPanel" style="display:none;"></div>
+</main>
+
+<script>
+(() => {
+  // ====== Default bomb definition (editable via KP panel) ======
+  const defaultBomb = {
+    turns: 12,
+    panel_password: "A-19",
+    screw_sequence: ["TL","TR","BR","BL"],
+    cover_wrong_cost: 1,
+
+    wires: [
+      "RED-1","RED-4","BLU-2","BLU-7",
+      "GRN-3","GRN-8","YEL-5","ORG-6",
+      "PUR-9","PNK-10"
+    ],
+
+    // "答え"（KPが編集可能）
+    first_correct_wires: ["RED-1","YEL-5"], // 最初に切る正解2本
+    sum_target: 10,
+    last_color: "RED",
+
+    wire_mistakes_allowed: 1
+  };
+
+  // ====== State ======
+  const state = {
+    bomb: structuredClone(defaultBomb),
+    status: "armed", // armed/defused/exploded
+    stage: "sealed", // sealed/panel/cut
+    turnsLeft: defaultBomb.turns,
+
+    screwIndex: 0,
+    screwsRemoved: [],
+
+    panelFailures: 0,
+
+    wireCut: [],
+    wireMistakes: 0,
+
+    log: []
+  };
+
+  // KP auth
+  const KP_PASSWORD_HASH = "kp:" + "lovesushi"; // 超簡易（TRPG用途）。KPはパネルで変更する運用にしてOK。
+  let kpUnlocked = false;
+
+  // ====== Helpers ======
+  const $ = (id) => document.getElementById(id);
+  const now = () => new Date().toLocaleTimeString();
+
+  function addLog(msg, kind="") {
+    const prefix = kind === "ok" ? "✓ " : kind === "bad" ? "✗ " : "";
+    state.log.push({ t: now(), msg: prefix + msg });
+    if (state.log.length > 60) state.log.shift();
+  }
+
+  function clampTurns() {
+    state.turnsLeft = Math.max(0, Math.floor(state.turnsLeft));
+    if (state.status === "armed" && state.turnsLeft <= 0) {
+      explode("ターン切れ：爆発");
+    }
+  }
+
+  function consumeTurn(n=1) {
+    if (state.status !== "armed") return;
+    if (state.stage === "cut") return; // ★ cut工程はターン消費なし
+    state.turnsLeft -= n;
+    clampTurns();
+  }
+
+  function explode(reason) {
+    if (state.status !== "armed") return;
+    state.status = "exploded";
+    addLog(reason, "bad");
+  }
+
+  function defuse(reason="解除成功：カウント停止") {
+    if (state.status !== "armed") return;
+    state.status = "defused";
+    addLog(reason, "ok");
+  }
+
+  function parseWire(w) {
+    const [color, numStr] = w.split("-");
+    return { color, num: Number(numStr) };
+  }
+
+  function computeLastWire() {
+    const [w1, w2] = state.bomb.first_correct_wires;
+    const a = parseWire(w1).num;
+    const b = parseWire(w2).num;
+    const lastNumber = Number(state.bomb.sum_target) - a - b;
+    return `${state.bomb.last_color}-${lastNumber}`;
+  }
+
+  function correctWiresSet() {
+    const lastWire = computeLastWire();
+    return new Set([...state.bomb.first_correct_wires, lastWire]);
+  }
+
+  function correctProgress() {
+    const set = correctWiresSet();
+    return state.wireCut.filter(w => set.has(w)).length;
+  }
+
+  function mistakesRemaining() {
+    return Math.max(0, Number(state.bomb.wire_mistakes_allowed) - state.wireMistakes);
+  }
+
+  function validateBombDef(b) {
+    // Basic checks to avoid UI ambiguity
+    if (!Array.isArray(b.wires) || b.wires.length !== 10) return "wiresは10本にしてください";
+    const uniq = new Set(b.wires);
+    if (uniq.size !== b.wires.length) return "同じ『色-番号』が重複しています（区別できないのでNG）";
+    for (const w of b.wires) {
+      if (!/^[A-Z]{3}-\d+$/.test(w)) return "ワイヤー名は例：RED-1 の形式にしてください（英大文字3桁-数字）";
+    }
+    if (!Array.isArray(b.first_correct_wires) || b.first_correct_wires.length !== 2) return "first_correct_wiresは2本指定してください";
+    for (const w of b.first_correct_wires) if (!b.wires.includes(w)) return "first_correct_wiresにwiresに無い線が含まれています";
+    if (!Number.isFinite(Number(b.sum_target))) return "sum_targetは数値にしてください";
+    if (!/^[A-Z]{3}$/.test(String(b.last_color))) return "last_colorは例：RED の形式（英大文字3桁）にしてください";
+    if (!Array.isArray(b.screw_sequence) || b.screw_sequence.length !== 4) return "screw_sequenceは4要素にしてください";
+    if (!Number.isFinite(Number(b.turns))) return "turnsは数値にしてください";
+    if (!Number.isFinite(Number(b.cover_wrong_cost))) return "cover_wrong_costは数値にしてください";
+    if (!Number.isFinite(Number(b.wire_mistakes_allowed))) return "wire_mistakes_allowedは数値にしてください";
+    // lastWire should exist in wires
+    const temp = structuredClone(state);
+    const saved = state.bomb;
+    state.bomb = b;
+    const lw = computeLastWire();
+    state.bomb = saved;
+    if (!b.wires.includes(lw)) return `算出される最後線（${lw}）が wires に存在しません`;
+    // ensure lastWire not one of first two (shouldn't be)
+    if (b.first_correct_wires.includes(lw)) return "算出される最後線が first_correct_wires と重複しています";
+    return null;
+  }
+
+  // ====== Render ======
+  function render() {
+    // Status + turns
+    $("statusLine").textContent = `${state.status} / stage:${state.stage}`;
+    $("statusLine").className = "pill " + (state.status === "defused" ? "ok" : state.status === "exploded" ? "bad" : "");
+    $("turnsLine").textContent = state.stage === "cut" ? `T-${state.turnsLeft}` : `T-${state.turnsLeft}`;
+    $("stageHint").textContent =
+      state.stage === "sealed" ? "外装固定：四隅のネジを順番に外せ（1操作=1ターン、誤りは追加消費）" :
+      state.stage === "panel"  ? "内部パネル：パスワード入力（3回ミスで爆発、1回=1ターン）" :
+      "配線：10本から3本を選ぶ（ここからターン消費なし／最後線の早切りは即爆発）";
+
+    // Progress card
+    const prog =
+      state.stage === "sealed" ? `ネジ進捗：${state.screwIndex}/4（済: ${state.screwsRemoved.join(", ") || "なし"}）` :
+      state.stage === "panel" ? `パス失敗：${state.panelFailures}/3（残り ${Math.max(0, 3 - state.panelFailures)} 回）` :
+      `正解進捗：${correctProgress()}/3　ミス残：${mistakesRemaining()}　切断済：${state.wireCut.length}本`;
+
+    $("progressLine").innerHTML = prog;
+
+    // Warning line
+    if (state.stage === "cut" && state.status === "armed") {
+      const lw = computeLastWire();
+      $("warningLine").textContent = `※注意：${lw} は「最後」に切らないといけない（早切りは即爆発）`;
+    } else {
+      $("warningLine").textContent = "";
+    }
+
+    // Action card (stage UI)
+    $("actionCard").innerHTML = "";
+    if (state.status !== "armed") {
+      const msg = state.status === "defused" ? "解除成功。" : "爆発。";
+      $("actionCard").innerHTML = `<div class="${state.status === "defused" ? "ok" : "bad"}" style="font-size:18px;font-weight:700;">${msg}</div>`;
+    } else if (state.stage === "sealed") {
+      renderSealed();
+    } else if (state.stage === "panel") {
+      renderPanel();
+    } else {
+      renderCut();
+    }
+
+    // Log
+    $("logList").innerHTML = state.log.slice().reverse().map(e =>
+      `<li><span class="muted">${e.t}</span> — ${escapeHtml(e.msg)}</li>`
+    ).join("") || `<li class="muted">（まだログはありません）</li>`;
+
+    // KP panel
+    $("kpTitle").style.display = kpUnlocked ? "" : "none";
+    $("kpPanel").style.display = kpUnlocked ? "" : "none";
+    if (kpUnlocked) renderKP();
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  function renderSealed() {
+    const seq = state.bomb.screw_sequence;
+    const expected = seq[state.screwIndex];
+    $("actionCard").innerHTML = `
+      <div class="muted tiny">次に外すべき位置は探索情報で特定する想定（間違えても即死ではないがターンを失う）。</div>
+      <div style="margin-top:10px;" class="grid2">
+        ${["TL","TR","BL","BR"].map(pos => `
+          <button ${state.screwsRemoved.includes(pos) ? "disabled" : ""} onclick="window.__act_screw('${pos}')">
+            ネジ: ${pos} ${state.screwsRemoved.includes(pos) ? "（済）" : ""}
+          </button>
+        `).join("")}
+      </div>
+      <div class="muted tiny" style="margin-top:10px;">
+        （内部仕様）期待位置: <span class="pill">${expected}</span>
+      </div>
+    `;
+  }
+
+  function renderPanel() {
+    $("actionCard").innerHTML = `
+      <div class="muted tiny">パスワード入力は1回につき1ターン消費。3回ミスで爆発。</div>
+      <div style="margin-top:10px;">
+        <input id="panelInput" placeholder="パスワード" autocomplete="off" />
+        <button style="margin-top:10px;" onclick="window.__act_panel()">解錠</button>
+      </div>
+      <div class="muted tiny" style="margin-top:10px;">残り試行：<span class="pill">${Math.max(0, 3 - state.panelFailures)}</span></div>
+    `;
+  }
+
+  function renderCut() {
+    const wires = state.bomb.wires;
+    $("actionCard").innerHTML = `
+      <div class="muted tiny">ここから先はターン消費なし。10本のうち3本を選べ。最後の一本は指定線でないと爆発。</div>
+      <div style="margin-top:10px;" class="grid3">
+        ${wires.map(w => `
+          <button class="${state.wireCut.includes(w) ? "danger" : ""}" ${state.wireCut.includes(w) ? "disabled" : ""} onclick="window.__act_cut('${w}')">
+            CUT: ${w} ${state.wireCut.includes(w) ? "（済）" : ""}
+          </button>
+        `).join("")}
+      </div>
+    `;
+  }
+
+  // ====== Actions ======
+  window.__act_screw = (pos) => {
+    if (state.status !== "armed" || state.stage !== "sealed") return;
+    if (state.screwsRemoved.includes(pos)) return;
+
+    const seq = state.bomb.screw_sequence;
+    const expected = seq[state.screwIndex];
+
+    if (!confirm(`ネジ ${pos} を外す？（1ターン消費）`)) return;
+
+    consumeTurn(1);
+
+    if (pos === expected) {
+      state.screwsRemoved.push(pos);
+      state.screwIndex += 1;
+      addLog(`ネジ(${pos})を外した（${state.screwIndex}/4）`, "ok");
+      if (state.screwIndex >= 4) {
+        state.stage = "panel";
+        addLog("四隅の固定が解除された。カバーが開く。");
+      }
+    } else {
+      addLog(`ネジ(${pos})…違う。工具が空回りする。`, "bad");
+      const extra = Number(state.bomb.cover_wrong_cost) || 0;
+      if (extra > 0) {
+        consumeTurn(extra);
+        addLog(`手間取った：追加で -${extra} ターン`);
+      }
+    }
+    render();
+  };
+
+  window.__act_panel = () => {
+    if (state.status !== "armed" || state.stage !== "panel") return;
+    const val = ($("panelInput")?.value ?? "").trim();
+    if (!confirm("パスワードを入力して解錠を試みる？（1ターン消費）")) return;
+
+    consumeTurn(1);
+
+    if (val === state.bomb.panel_password) {
+      state.stage = "cut";
+      addLog("パネル解錠：配線にアクセス可能になった。", "ok");
+      render();
+      return;
+    }
+
+    state.panelFailures += 1;
+    const remaining = 3 - state.panelFailures;
+    if (state.panelFailures >= 3) {
+      explode("パスワード3回失敗：ロックアウト → 爆発");
+    } else {
+      addLog(`パスワード不一致：残り${remaining}回`, "bad");
+    }
+    render();
+  };
+
+  window.__act_cut = (wire) => {
+    if (state.status !== "armed" || state.stage !== "cut") return;
+    if (state.wireCut.includes(wire)) return;
+
+    if (!confirm(`本当に ${wire} を切る？（取り消し不可）`)) return;
+
+    const lastWire = computeLastWire();
+    const correctSet = correctWiresSet();
+
+    // ★ 早切り即爆発：最後線を、正解2本が揃う前に切ったら即死
+    if (wire === lastWire) {
+      const alreadyCorrect = state.wireCut.filter(w => correctSet.has(w)).length;
+      if (alreadyCorrect < 2) {
+        state.wireCut.push(wire);
+        explode(`最終遮断線（${wire}）を早まって切った：爆発`);
+        render();
+        return;
+      }
+    }
+
+    // Cut it
+    state.wireCut.push(wire);
+
+    if (correctSet.has(wire)) {
+      addLog(`切断成功（${wire}）…反応あり（正解 ${correctProgress()}/3）`, "ok");
+
+      // if all 3 correct have been cut, verify last cut is lastWire
+      if (correctProgress() >= 3) {
+        const lastCut = state.wireCut[state.wireCut.length - 1];
+        if (lastCut === lastWire) {
+          defuse();
+        } else {
+          explode("最後の一本が違う：爆発");
+        }
+      }
+    } else {
+      // mistakes: 1 allowed, 2nd -> explode
+      state.wireMistakes += 1;
+      if (state.wireMistakes > Number(state.bomb.wire_mistakes_allowed)) {
+        explode(`誤切断（${wire}）…2回目のミス：爆発`);
+      } else {
+        addLog(`誤切断（${wire}）…警告音（残り許容ミス ${mistakesRemaining()}）`, "bad");
+      }
+    }
+
+    render();
+  };
+
+  // ====== KP mode ======
+  $("kpToggleBtn").addEventListener("click", () => {
+    if (!kpUnlocked) {
+      const pw = prompt("KPパスワードを入力");
+      if (!pw) return;
+
+      // 超簡易比較（TRPG用途）。必要ならここをSHA等に変える
+      if (("kp:" + pw) === KP_PASSWORD_HASH) {
+        kpUnlocked = true;
+        addLog("KPモード：解錠");
+      } else {
+        alert("パスワードが違います");
+      }
+    } else {
+      kpUnlocked = false;
+      addLog("KPモード：ロック");
+    }
+    render();
+  });
+
+  function renderKP() {
+    const lw = computeLastWire();
+    $("kpPanel").innerHTML = `
+      <div class="muted tiny">KPのみ：答え・状態を編集できます（PLに見せない運用推奨）。</div>
+
+      <h2>答えの操作</h2>
+      <div class="grid2">
+        <div>
+          <div class="muted tiny">パネルパスワード（答え）</div>
+          <input id="kp_panel_pw" value="${escapeHtml(state.bomb.panel_password)}" />
+        </div>
+        <div>
+          <div class="muted tiny">最後の色（暗号復号結果）</div>
+          <input id="kp_last_color" value="${escapeHtml(state.bomb.last_color)}" />
+        </div>
+      </div>
+
+      <div style="margin-top:10px;" class="grid2">
+        <div>
+          <div class="muted tiny">最初に切る正解2本（答え）</div>
+          <select id="kp_first1">${state.bomb.wires.map(w=>`<option ${w===state.bomb.first_correct_wires[0]?"selected":""}>${w}</option>`).join("")}</select>
+          <div style="height:8px;"></div>
+          <select id="kp_first2">${state.bomb.wires.map(w=>`<option ${w===state.bomb.first_correct_wires[1]?"selected":""}>${w}</option>`).join("")}</select>
+          <div class="muted tiny" style="margin-top:6px;">※同じ線を2回指定しない</div>
+        </div>
+        <div>
+          <div class="muted tiny">番号総和（S）</div>
+          <input id="kp_sum_target" type="number" value="${Number(state.bomb.sum_target)}" />
+          <div class="muted tiny" style="margin-top:10px;">（算出される最後線）</div>
+          <div class="pill">${lw}</div>
+        </div>
+      </div>
+
+      <div style="margin-top:10px;" class="grid2">
+        <div>
+          <div class="muted tiny">ワイヤーミス許容回数</div>
+          <input id="kp_mist_allowed" type="number" value="${Number(state.bomb.wire_mistakes_allowed)}" />
+        </div>
+        <div>
+          <div class="muted tiny">残りターン（現在 ${state.turnsLeft}）</div>
+          <div class="grid2">
+            <button onclick="window.__kp_turn(-1)">-1</button>
+            <button onclick="window.__kp_turn(-2)">-2</button>
+          </div>
+          <div style="height:8px;"></div>
+          <div class="grid2">
+            <button onclick="window.__kp_turn(1)">+1</button>
+            <button onclick="window.__kp_turn(2)">+2</button>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top:10px;" class="grid2">
+        <button onclick="window.__kp_apply_answers()">答えを適用</button>
+        <button onclick="window.__kp_stage()">ステージ強制変更</button>
+      </div>
+
+      <div style="margin-top:10px;" class="grid2">
+        <button onclick="window.__kp_force('defuse')">強制解除</button>
+        <button onclick="window.__kp_force('explode')">強制爆発</button>
+      </div>
+
+      <h2>ワイヤー一覧編集（10本）</h2>
+      <div class="muted tiny">改変したい場合のみ。形式は RED-1 のように英大文字3桁-数字。重複禁止。</div>
+      <textarea id="kp_wires">${state.bomb.wires.join("\n")}</textarea>
+      <div style="margin-top:10px;" class="grid2">
+        <button onclick="window.__kp_apply_wires()">ワイヤー適用</button>
+        <button onclick="window.__kp_export()">爆弾JSONを書き出し</button>
+      </div>
+
+      <h2>ログ追記</h2>
+      <div class="grid2">
+        <input id="kp_note" placeholder="例：『警告ラベルを発見』" />
+        <button onclick="window.__kp_note()">追記</button>
+      </div>
+    `;
+  }
+
+  window.__kp_turn = (delta) => {
+    if (!kpUnlocked) return;
+    state.turnsLeft += delta;
+    clampTurns();
+    addLog(`KP操作：ターン ${delta>0?"+":""}${delta}`);
+    render();
+  };
+
+  window.__kp_force = (what) => {
+    if (!kpUnlocked) return;
+    if (!confirm(`KP操作：${what==="defuse"?"強制解除":"強制爆発"}していい？`)) return;
+    if (what === "defuse") defuse("KP操作：強制解除");
+    else explode("KP操作：強制爆発");
+    render();
+  };
+
+  window.__kp_note = () => {
+    if (!kpUnlocked) return;
+    const v = ($("kp_note").value || "").trim();
+    if (!v) return;
+    addLog(`KPメモ：${v}`);
+    $("kp_note").value = "";
+    render();
+  };
+
+  window.__kp_stage = () => {
+    if (!kpUnlocked) return;
+    const next = prompt("stageを入力（sealed / panel / cut）", state.stage);
+    if (!next) return;
+    if (!["sealed","panel","cut"].includes(next)) return alert("sealed/panel/cut のどれか");
+    state.stage = next;
+    addLog(`KP操作：stageを ${next} に変更`);
+    render();
+  };
+
+  window.__kp_apply_answers = () => {
+    if (!kpUnlocked) return;
+
+    const newBomb = structuredClone(state.bomb);
+    newBomb.panel_password = ($("kp_panel_pw").value || "").trim();
+    newBomb.last_color = ($("kp_last_color").value || "").trim().toUpperCase();
+    newBomb.sum_target = Number($("kp_sum_target").value);
+    newBomb.wire_mistakes_allowed = Number($("kp_mist_allowed").value);
+
+    const f1 = $("kp_first1").value;
+    const f2 = $("kp_first2").value;
+    if (f1 === f2) return alert("最初の正解2本が同じです（別の線にしてください）");
+    newBomb.first_correct_wires = [f1, f2];
+
+    const err = validateBombDef(newBomb);
+    if (err) return alert("適用できません: " + err);
+
+    state.bomb = newBomb;
+    addLog("KP操作：答えを適用");
+    render();
+  };
+
+  window.__kp_apply_wires = () => {
+    if (!kpUnlocked) return;
+
+    const lines = ($("kp_wires").value || "")
+      .split("\n")
+      .map(s => s.trim())
+      .filter(Boolean);
+
+    const newBomb = structuredClone(state.bomb);
+    newBomb.wires = lines;
+
+    const err = validateBombDef(newBomb);
+    if (err) return alert("適用できません: " + err);
+
+    // apply
+    state.bomb = newBomb;
+
+    // If current selections are no longer valid, reset cut progress
+    state.wireCut = [];
+    state.wireMistakes = 0;
+
+    addLog("KP操作：ワイヤー一覧を適用（切断履歴をリセット）");
+    render();
+  };
+
+  window.__kp_export = () => {
+    if (!kpUnlocked) return;
+    const obj = structuredClone(state.bomb);
+    const json = JSON.stringify(obj, null, 2);
+    navigator.clipboard?.writeText(json).then(
+      ()=>alert("爆弾JSONをクリップボードにコピーしました"),
+      ()=>prompt("コピーできない環境です。手動でコピーしてください:", json)
+    );
+  };
+
+  // ====== Reset ======
+  $("resetBtn").addEventListener("click", () => {
+    if (!confirm("状態をリセットします（答えは現在の設定を維持）。OK？")) return;
+
+    const keepBomb = structuredClone(state.bomb);
+    Object.assign(state, {
+      bomb: keepBomb,
+      status: "armed",
+      stage: "sealed",
+      turnsLeft: Number(keepBomb.turns),
+
+      screwIndex: 0,
+      screwsRemoved: [],
+
+      panelFailures: 0,
+
+      wireCut: [],
+      wireMistakes: 0,
+
+      log: []
+    });
+    addLog("リセット完了");
+    render();
+  });
+
+  // ====== Initial log + render ======
+  addLog("システム起動。探索で情報を得てから操作せよ。");
+  render();
+
+  // NOTE: KP_PASSWORD_HASHは簡易。TRPG用途なので「覗かれにくい」程度。
+  // 本気で隠すなら、KPパスをその場入力→セッション中のみ保持、など運用でカバー推奨。
+})();
+</script>
+</body>
+</html>
